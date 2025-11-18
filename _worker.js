@@ -1257,8 +1257,8 @@ export default {
       throw new Error(`Failed to fetch ${url} after ${retries} retries`);
     }
 
-    async function registerWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+    async function registerWebhook(请求) {
+      const webhookUrl = `${new 网站(请求.url).origin}/webhook`;
       const response = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1277,7 +1277,7 @@ export default {
     }
 
     try {
-      return await handleRequest(request);
+      return await handleRequest(请求);
     } catch (error) {
       return new Response('Internal Server Error', { status: 500 });
     }

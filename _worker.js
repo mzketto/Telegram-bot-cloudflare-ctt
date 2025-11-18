@@ -46,7 +46,7 @@ const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
 
 export default {
-  async fetch(request, env) {
+  async fetch(请求, env) {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
@@ -56,26 +56,26 @@ export default {
     }
 
     if (!isInitialized) {
-      await initialize(env.D1, request);
+      await initialize(env.D1, 请求);
       isInitialized = true;
     }
 
-    async function handleRequest(request) {
+    async function handleRequest(请求) {
       if (!BOT_TOKEN || !GROUP_ID) {
         return new Response('Server configuration error: Missing required environment variables', { status: 500 });
       }
 
-      const url = new URL(request.url);
+      const url = new 网站(请求.url);
       if (url.pathname === '/webhook') {
         try {
-          const update = await request.json();
+          const update = await 请求.json();
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
-        return await registerWebhook(request);
+        return await registerWebhook(请求);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
       } else if (url.pathname === '/checkTables') {
@@ -85,17 +85,17 @@ export default {
       return new Response('Not Found', { status: 404 });
     }
 
-    async function initialize(d1, request) {
+    async function initialize(d1, 请求) {
       await Promise.all([
         checkAndRepairTables(d1),
-        autoRegisterWebhook(request),
+        autoRegisterWebhook(请求),
         checkBotPermissions(),
         cleanExpiredVerificationCodes(d1)
       ]);
     }
 
-    async function autoRegisterWebhook(request) {
-      const webhookUrl = `${new URL(request.url).origin}/webhook`;
+    async function autoRegisterWebhook(请求) {
+      const webhookUrl = `${new 网站(请求.url).origin}/webhook`;
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -589,7 +589,7 @@ export default {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
 
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/start.md');
+      const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/start.md');
       if (!response.ok) return '验证成功！您现在可以与我聊天。';
       const message = await response.text();
       return message.trim() || '验证成功！您现在可以与我聊天。';

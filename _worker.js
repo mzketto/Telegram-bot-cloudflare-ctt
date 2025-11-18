@@ -555,7 +555,7 @@ export default {
         ],
         [
           { text: userRawEnabled ? '关闭用户Raw' : '开启用户Raw', callback_data: `toggle_user_raw_${privateChatId}` },
-          { text: 'GitHub项目', url: 'https://github.com/iawooo/ctt' }
+          { text: 'GitHub项目', url: 'https://github.com/mzketto/Telegram-bot-cloudflare-ctt' }
         ],
         [
           { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
@@ -596,7 +596,7 @@ export default {
     }
 
     async function getNotificationContent() {
-      const response = await fetch('https://raw.githubusercontent.com/iawooo/ctt/refs/heads/main/CFTeleTrans/notification.md');
+      const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/notification.md');
       if (!response.ok) return '';
       const content = await response.text();
       return content.trim() || '';

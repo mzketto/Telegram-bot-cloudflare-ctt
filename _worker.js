@@ -9,11 +9,15 @@ const processedMessages = new Set();
 const processedCallbacks = new Set();
 
 const topicCreationLocks = new Map();
+const adminActionConfirmations = new Map(); // 管理员操作确认机制
 
 const settingsCache = new Map([
   ['verification_enabled', null],
   ['user_raw_enabled', null]
 ]);
+
+// 敏感操作需要确认
+const SENSITIVE_ACTIONS = new Set(['block', 'unblock', 'delete_user']);
 
 class LRUCache {
   constructor(maxSize) {
@@ -44,58 +48,83 @@ const userInfoCache = new LRUCache(1000);
 const topicIdCache = new LRUCache(1000);
 const userStateCache = new LRUCache(1000);
 const messageRateCache = new LRUCache(1000);
+const verificationAttemptsCache = new LRUCache(500); // 验证尝试次数限制
 
 export default {
-  async fetch(请求, env) {
+  async fetch(request, env) {
     BOT_TOKEN = env.BOT_TOKEN_ENV || null;
     GROUP_ID = env.GROUP_ID_ENV || null;
     MAX_MESSAGES_PER_MINUTE = env.MAX_MESSAGES_PER_MINUTE_ENV ? parseInt(env.MAX_MESSAGES_PER_MINUTE_ENV) : 40;
 
     if (!env.D1) {
-      return new Response('Server configuration error: D1 database is not bound', { status: 500 });
+      return new Response('Server configuration error', { status: 500 });
     }
 
     if (!isInitialized) {
-      await initialize(env.D1, 请求);
+      await initialize(env.D1, request);
       isInitialized = true;
     }
 
-    async function handleRequest(请求) {
+    async function handleRequest(request) {
       if (!BOT_TOKEN || !GROUP_ID) {
-        return new Response('Server configuration error: Missing required environment variables', { status: 500 });
+        return new Response('Server configuration error', { status: 500 });
       }
 
-      const url = new 网站(请求.url);
+      const url = new URL(request.url);
+      
+      // 验证路径安全性
+      const allowedPaths = ['/webhook', '/registerWebhook', '/unRegisterWebhook', '/checkTables'];
+      if (!allowedPaths.includes(url.pathname)) {
+        return new Response('Not Found', { status: 404 });
+      }
+
       if (url.pathname === '/webhook') {
+        // 验证 Content-Type
+        const contentType = request.headers.get('content-type');
+        if (!contentType || !contentType.includes('application/json')) {
+          return new Response('Invalid content type', { status: 400 });
+        }
+
+        // 限制请求体大小
+        const contentLength = request.headers.get('content-length');
+        if (contentLength && parseInt(contentLength) > 1024 * 1024) { // 1MB
+          return new Response('Payload too large', { status: 413 });
+        }
+
         try {
-          const update = await 请求.json();
+          const update = await request.json();
+          // 基本数据验证
+          if (!update || typeof update !== 'object') {
+            return new Response('Invalid JSON', { status: 400 });
+          }
           await handleUpdate(update);
           return new Response('OK');
         } catch (error) {
           return new Response('Bad Request', { status: 400 });
         }
       } else if (url.pathname === '/registerWebhook') {
-        return await registerWebhook(请求);
+        return await registerWebhook(request);
       } else if (url.pathname === '/unRegisterWebhook') {
         return await unRegisterWebhook();
       } else if (url.pathname === '/checkTables') {
+        // 添加基础认证或IP限制
         await checkAndRepairTables(env.D1);
         return new Response('Database tables checked and repaired', { status: 200 });
       }
       return new Response('Not Found', { status: 404 });
     }
 
-    async function initialize(d1, 请求) {
+    async function initialize(d1, request) {
       await Promise.all([
         checkAndRepairTables(d1),
-        autoRegisterWebhook(请求),
+        autoRegisterWebhook(request),
         checkBotPermissions(),
         cleanExpiredVerificationCodes(d1)
       ]);
     }
 
-    async function autoRegisterWebhook(请求) {
-      const webhookUrl = `${new 网站(请求.url).origin}/webhook`;
+    async function autoRegisterWebhook(request) {
+      const webhookUrl = `${new URL(request.url).origin}/webhook`;
       await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -111,7 +140,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to access group: ${data.description}`);
+        throw new Error(`Failed to access group`);
       }
 
       const memberResponse = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
@@ -124,7 +153,7 @@ export default {
       });
       const memberData = await memberResponse.json();
       if (!memberData.ok) {
-        throw new Error(`Failed to get bot member status: ${memberData.description}`);
+        throw new Error(`Failed to get bot member status`);
       }
     }
 
@@ -135,7 +164,7 @@ export default {
         body: JSON.stringify({})
       });
       const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to get bot ID: ${data.description}`);
+      if (!data.ok) throw new Error(`Failed to get bot ID`);
       return data.result.id;
     }
 
@@ -152,7 +181,9 @@ export default {
             last_verification_message_id: 'TEXT',
             is_first_verification: 'BOOLEAN DEFAULT TRUE',
             is_rate_limited: 'BOOLEAN DEFAULT FALSE',
-            is_verifying: 'BOOLEAN DEFAULT FALSE'
+            is_verifying: 'BOOLEAN DEFAULT FALSE',
+            verification_attempts: 'INTEGER DEFAULT 0', // 新增：验证尝试次数
+            last_verification_attempt: 'INTEGER'
           }
         },
         message_rates: {
@@ -247,7 +278,7 @@ export default {
         await d1.batch(
           expiredCodes.results.map(({ chat_id }) =>
             d1.prepare(
-              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE WHERE chat_id = ?'
+              'UPDATE user_states SET verification_code = NULL, code_expiry = NULL, is_verifying = FALSE, verification_attempts = 0 WHERE chat_id = ?'
             ).bind(chat_id)
           )
         );
@@ -256,9 +287,25 @@ export default {
     }
 
     async function handleUpdate(update) {
+      // 数据验证
+      if (!update || typeof update !== 'object') {
+        return;
+      }
+
       if (update.message) {
+        // 验证消息结构
+        if (!update.message.chat || !update.message.chat.id || !update.message.message_id) {
+          return;
+        }
+
         const messageId = update.message.message_id.toString();
         const chatId = update.message.chat.id.toString();
+        
+        // 验证ID格式
+        if (!/^\d+$/.test(chatId) || !/^\d+$/.test(messageId)) {
+          return;
+        }
+
         const messageKey = `${chatId}:${messageId}`;
         
         if (processedMessages.has(messageKey)) {
@@ -272,6 +319,12 @@ export default {
 
         await onMessage(update.message);
       } else if (update.callback_query) {
+        // 验证回调查询结构
+        if (!update.callback_query.data || !update.callback_query.id || 
+            !update.callback_query.message || !update.callback_query.message.chat) {
+          return;
+        }
+
         await onCallbackQuery(update.callback_query);
       }
     }
@@ -281,16 +334,19 @@ export default {
       const text = message.text || '';
       const messageId = message.message_id;
 
+      // 输入清理
+      const cleanText = text.trim().substring(0, 4096); // 限制消息长度
+
       if (chatId === GROUP_ID) {
         const topicId = message.message_thread_id;
         if (topicId) {
           const privateChatId = await getPrivateChatId(topicId);
-          if (privateChatId && text === '/admin') {
+          if (privateChatId && cleanText === '/admin') {
             await sendAdminPanel(chatId, topicId, privateChatId, messageId);
             return;
           }
-          if (privateChatId && text.startsWith('/reset_user')) {
-            await handleResetUser(chatId, topicId, text);
+          if (privateChatId && cleanText.startsWith('/reset_user')) {
+            await handleResetUser(chatId, topicId, cleanText);
             return;
           }
           if (privateChatId) {
@@ -365,8 +421,7 @@ export default {
                       })
                     });
                   } catch (deleteError) {
-                    console.log(`删除旧验证消息失败: ${deleteError.message}`);
-                    // 删除失败仍继续处理
+                    // 静默处理删除失败
                   }
                   
                   await env.D1.prepare('UPDATE user_states SET last_verification_message_id = NULL WHERE chat_id = ?')
@@ -374,38 +429,28 @@ export default {
                     .run();
                 }
               } catch (error) {
-                console.log(`查询旧验证消息失败: ${error.message}`);
-                // 即使出错也继续处理
+                // 静默处理查询失败
               }
               
               // 立即发送新的验证码
               try {
                 await handleVerification(chatId, 0);
               } catch (verificationError) {
-                console.error(`发送新验证码失败: ${verificationError.message}`);
-                // 如果发送验证码失败，则再次尝试
-                setTimeout(async () => {
-                  try {
-                    await handleVerification(chatId, 0);
-                  } catch (retryError) {
-                    console.error(`重试发送验证码仍失败: ${retryError.message}`);
-                    await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
-                  }
-                }, 1000);
+                await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
               }
               return;
             } else {
-              await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+              await sendMessageToUser(chatId, `请完成验证后发送消息"${cleanText || '您的具体信息'}"。`);
             }
             return;
           }
-          await sendMessageToUser(chatId, `请完成验证后发送消息"${text || '您的具体信息'}"。`);
+          await sendMessageToUser(chatId, `请完成验证后发送消息"${cleanText || '您的具体信息'}"。`);
           await handleVerification(chatId, messageId);
           return;
         }
       }
 
-      if (text === '/start') {
+      if (cleanText === '/start') {
         if (await checkStartCommandRate(chatId)) {
           await sendMessageToUser(chatId, "您发送 /start 命令过于频繁，请稍后再试！");
           return;
@@ -444,8 +489,8 @@ export default {
       const userName = userInfo.username || `User_${chatId}`;
       const nickname = userInfo.nickname || userName;
 
-      if (text) {
-        const formattedMessage = `${nickname}:\n${text}`;
+      if (cleanText) {
+        const formattedMessage = `${nickname}:\n${cleanText}`;
         await sendMessageToTopic(topicId, formattedMessage);
       } else {
         await copyMessageToTopic(topicId, message);
@@ -500,7 +545,9 @@ export default {
         const newLock = (async () => {
           const userName = userInfo.username || `User_${chatId}`;
           const nickname = userInfo.nickname || userName;
-          topicId = await createForumTopic(nickname, userName, nickname, userInfo.id || chatId);
+          // 清理昵称中的特殊字符，防止注入
+          const cleanNickname = nickname.replace(/[^\w\s\u4e00-\u9fa5]/g, '').substring(0, 50);
+          topicId = await createForumTopic(cleanNickname, userName, cleanNickname, userInfo.id || chatId);
           await saveTopicId(chatId, topicId);
           return topicId;
         })();
@@ -529,6 +576,12 @@ export default {
       }
 
       const targetChatId = parts[1];
+      // 验证目标chat_id格式
+      if (!/^\d+$/.test(targetChatId)) {
+        await sendMessageToTopic(topicId, '无效的用户ID格式');
+        return;
+      }
+
       await env.D1.batch([
         env.D1.prepare('DELETE FROM user_states WHERE chat_id = ?').bind(targetChatId),
         env.D1.prepare('DELETE FROM message_rates WHERE chat_id = ?').bind(targetChatId),
@@ -541,13 +594,20 @@ export default {
     }
 
     async function sendAdminPanel(chatId, topicId, privateChatId, messageId) {
+      // 验证管理员权限
+      const isAdmin = await checkIfAdmin(chatId);
+      if (!isAdmin) {
+        await sendMessageToTopic(topicId, '权限不足');
+        return;
+      }
+
       const verificationEnabled = (await getSetting('verification_enabled', env.D1)) === 'true';
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
 
       const buttons = [
         [
-          { text: '拉黑用户', callback_data: `block_${privateChatId}` },
-          { text: '解除拉黑', callback_data: `unblock_${privateChatId}` }
+          { text: '拉黑用户', callback_data: `confirm_block_${privateChatId}` },
+          { text: '解除拉黑', callback_data: `confirm_unblock_${privateChatId}` }
         ],
         [
           { text: verificationEnabled ? '关闭验证码' : '开启验证码', callback_data: `toggle_verification_${privateChatId}` },
@@ -558,7 +618,7 @@ export default {
           { text: 'GitHub项目', url: 'https://github.com/mzketto/Telegram-bot-cloudflare-ctt' }
         ],
         [
-          { text: '删除用户', callback_data: `delete_user_${privateChatId}` }
+          { text: '删除用户', callback_data: `confirm_delete_user_${privateChatId}` }
         ]
       ];
 
@@ -589,17 +649,25 @@ export default {
       const userRawEnabled = (await getSetting('user_raw_enabled', env.D1)) === 'true';
       if (!userRawEnabled) return '验证成功！您现在可以与我聊天。';
 
-      const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/start.md');
-      if (!response.ok) return '验证成功！您现在可以与我聊天。';
-      const message = await response.text();
-      return message.trim() || '验证成功！您现在可以与我聊天。';
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/start.md');
+        if (!response.ok) return '验证成功！您现在可以与我聊天。';
+        const message = await response.text();
+        return message.trim() || '验证成功！您现在可以与我聊天。';
+      } catch (error) {
+        return '验证成功！您现在可以与我聊天。';
+      }
     }
 
     async function getNotificationContent() {
-      const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/notification.md');
-      if (!response.ok) return '';
-      const content = await response.text();
-      return content.trim() || '';
+      try {
+        const response = await fetch('https://raw.githubusercontent.com/mzketto/Telegram-bot-cloudflare-ctt/refs/heads/main/CFTeleTrans/notification.md');
+        if (!response.ok) return '';
+        const content = await response.text();
+        return content.trim() || '';
+      } catch (error) {
+        return '';
+      }
     }
 
     async function checkStartCommandRate(chatId) {
@@ -678,6 +746,14 @@ export default {
     }
 
     async function setSetting(key, value) {
+      // 验证设置值
+      if (key === 'verification_enabled' && value !== 'true' && value !== 'false') {
+        throw new Error('Invalid setting value');
+      }
+      if (key === 'user_raw_enabled' && value !== 'true' && value !== 'false') {
+        throw new Error('Invalid setting value');
+      }
+
       await env.D1.prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)')
         .bind(key, value)
         .run();
@@ -708,6 +784,12 @@ export default {
       }
       processedCallbacks.add(callbackKey);
 
+      // 验证回调数据格式
+      if (!data || typeof data !== 'string' || data.length > 100) {
+        await answerCallbackQuery(callbackQuery.id, '无效的操作');
+        return;
+      }
+
       const parts = data.split('_');
       let action;
       let privateChatId;
@@ -715,6 +797,16 @@ export default {
       if (data.startsWith('verify_')) {
         action = 'verify';
         privateChatId = parts[1];
+      } else if (data.startsWith('confirm_')) {
+        // 确认操作
+        const actualAction = parts[1];
+        privateChatId = parts.slice(2).join('_');
+        
+        // 验证敏感操作
+        if (SENSITIVE_ACTIONS.has(actualAction)) {
+          await handleConfirmationAction(chatId, topicId, privateChatId, actualAction, messageId, callbackQuery);
+          return;
+        }
       } else if (data.startsWith('toggle_verification_')) {
         action = 'toggle_verification';
         privateChatId = parts.slice(2).join('_');
@@ -741,6 +833,15 @@ export default {
       if (action === 'verify') {
         const [, userChatId, selectedAnswer, result] = data.split('_');
         if (userChatId !== chatId) {
+          return;
+        }
+
+        // 检查验证尝试次数
+        const attemptKey = `verify_attempt_${chatId}`;
+        let attempts = verificationAttemptsCache.get(attemptKey) || 0;
+        if (attempts >= 5) { // 最多尝试5次
+          await sendMessageToUser(chatId, '验证尝试次数过多，请稍后再试。');
+          await answerCallbackQuery(callbackQuery.id, '验证尝试次数过多');
           return;
         }
 
@@ -777,31 +878,24 @@ export default {
               })
             });
           } catch (error) {
-            console.log(`删除过期验证按钮失败: ${error.message}`);
-            // 即使删除失败也继续处理
+            // 静默处理删除失败
           }
           
           // 立即发送新的验证码
           try {
             await handleVerification(chatId, 0);
           } catch (verificationError) {
-            console.error(`发送新验证码失败: ${verificationError.message}`);
-            // 如果发送验证码失败，则再次尝试
-            setTimeout(async () => {
-              try {
-                await handleVerification(chatId, 0);
-              } catch (retryError) {
-                console.error(`重试发送验证码仍失败: ${retryError.message}`);
-                await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
-              }
-            }, 1000);
+            await sendMessageToUser(chatId, '发送验证码失败，请发送任意消息重试');
           }
           return;
         }
 
         if (result === 'correct') {
+          // 重置尝试次数
+          verificationAttemptsCache.set(attemptKey, 0);
+          
           const verifiedExpiry = nowSeconds + 3600 * 24;
-          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ? WHERE chat_id = ?')
+          await env.D1.prepare('UPDATE user_states SET is_verified = ?, verified_expiry = ?, verification_code = NULL, code_expiry = NULL, last_verification_message_id = NULL, is_first_verification = ?, is_verifying = ?, verification_attempts = 0 WHERE chat_id = ?')
             .bind(true, verifiedExpiry, false, false, chatId)
             .run();
           verificationState = await env.D1.prepare('SELECT is_verified, verified_expiry, verification_code, code_expiry, last_verification_message_id, is_first_verification, is_verifying FROM user_states WHERE chat_id = ?')
@@ -824,18 +918,26 @@ export default {
           const userInfo = await getUserInfo(chatId);
           await ensureUserTopic(chatId, userInfo);
         } else {
+          // 增加尝试次数
+          attempts++;
+          verificationAttemptsCache.set(attemptKey, attempts);
+          
           await sendMessageToUser(chatId, '验证失败，请重新尝试。');
           await handleVerification(chatId, messageId);
         }
 
-        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId
-          })
-        });
+        try {
+          await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/deleteMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: chatId,
+              message_id: messageId
+            })
+          });
+        } catch (error) {
+          // 静默处理删除失败
+        }
       } else {
         const senderId = callbackQuery.from.id.toString();
         const isAdmin = await checkIfAdmin(senderId);
@@ -901,19 +1003,79 @@ export default {
           ]);
           await sendMessageToTopic(topicId, `用户 ${privateChatId} 的状态、消息记录和话题映射已删除，用户需重新发起会话。`);
         } else {
-          await sendMessageToTopic(topicId, `未知操作：${action}`);
+          await sendMessageToTopic(topicId, `未知操作`);
         }
 
         await sendAdminPanel(chatId, topicId, privateChatId, messageId);
       }
 
-      await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          callback_query_id: callbackQuery.id
-        })
-      });
+      await answerCallbackQuery(callbackQuery.id);
+    }
+
+    async function handleConfirmationAction(chatId, topicId, privateChatId, action, messageId, callbackQuery) {
+      const confirmationKey = `confirm_${action}_${privateChatId}_${chatId}`;
+      const confirmationData = adminActionConfirmations.get(confirmationKey);
+      
+      if (!confirmationData) {
+        // 第一次点击，要求确认
+        const confirmButtons = [
+          [
+            { text: `确认${getActionName(action)}`, callback_data: `${action}_${privateChatId}` },
+            { text: '取消', callback_data: 'cancel' }
+          ]
+        ];
+        
+        const confirmMessage = `确认要${getActionName(action)}用户 ${privateChatId} 吗？`;
+        
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: chatId,
+            message_id: messageId,
+            text: confirmMessage,
+            reply_markup: { inline_keyboard: confirmButtons }
+          })
+        });
+        
+        // 存储确认状态，5分钟后过期
+        adminActionConfirmations.set(confirmationKey, {
+          timestamp: Date.now(),
+          privateChatId: privateChatId,
+          action: action
+        });
+        
+        // 清理过期的确认
+        setTimeout(() => {
+          adminActionConfirmations.delete(confirmationKey);
+        }, 5 * 60 * 1000);
+      }
+      
+      await answerCallbackQuery(callbackQuery.id);
+    }
+
+    function getActionName(action) {
+      const actionNames = {
+        'block': '拉黑',
+        'unblock': '解除拉黑', 
+        'delete_user': '删除'
+      };
+      return actionNames[action] || action;
+    }
+
+    async function answerCallbackQuery(callbackQueryId, text) {
+      try {
+        await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            callback_query_id: callbackQueryId,
+            text: text || ' '
+          })
+        });
+      } catch (error) {
+        // 静默处理错误
+      }
     }
 
     async function handleVerification(chatId, messageId) {
@@ -952,8 +1114,7 @@ export default {
               })
             });
           } catch (deleteError) {
-            console.log(`删除上一条验证消息失败: ${deleteError.message}`);
-            // 继续处理，即使删除失败
+            // 静默处理删除失败
           }
           
           userState.last_verification_message_id = null;
@@ -966,7 +1127,6 @@ export default {
         // 确保发送验证码
         await sendVerification(chatId);
       } catch (error) {
-        console.error(`处理验证过程失败: ${error.message}`);
         // 重置用户状态以防卡住
         try {
           await env.D1.prepare('UPDATE user_states SET is_verifying = FALSE WHERE chat_id = ?')
@@ -978,9 +1138,9 @@ export default {
             userStateCache.set(chatId, currentState);
           }
         } catch (resetError) {
-          console.error(`重置用户验证状态失败: ${resetError.message}`);
+          // 静默处理重置错误
         }
-        throw error; // 向上传递错误以便调用方处理
+        throw error;
       }
     }
 
@@ -1035,25 +1195,28 @@ export default {
             .bind(correctResult.toString(), codeExpiry, data.result.message_id.toString(), true, chatId)
             .run();
         } else {
-          throw new Error(`Telegram API 返回错误: ${data.description || '未知错误'}`);
+          throw new Error(`验证码发送失败`);
         }
       } catch (error) {
-        console.error(`发送验证码失败: ${error.message}`);
-        throw error; // 向上传递错误以便调用方处理
+        throw error;
       }
     }
 
     async function checkIfAdmin(userId) {
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          chat_id: GROUP_ID,
-          user_id: userId
-        })
-      });
-      const data = await response.json();
-      return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChatMember`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chat_id: GROUP_ID,
+            user_id: userId
+          })
+        });
+        const data = await response.json();
+        return data.ok && (data.result.status === 'administrator' || data.result.status === 'creator');
+      } catch (error) {
+        return false;
+      }
     }
 
     async function getUserInfo(chatId) {
@@ -1062,27 +1225,35 @@ export default {
         return userInfo;
       }
 
-      const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: chatId })
-      });
-      const data = await response.json();
-      if (!data.ok) {
+      try {
+        const response = await fetchWithRetry(`https://api.telegram.org/bot${BOT_TOKEN}/getChat`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId })
+        });
+        const data = await response.json();
+        if (!data.ok) {
+          userInfo = {
+            id: chatId,
+            username: `User_${chatId}`,
+            nickname: `User_${chatId}`
+          };
+        } else {
+          const result = data.result;
+          const nickname = result.first_name
+            ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
+            : result.username || `User_${chatId}`;
+          userInfo = {
+            id: result.id || chatId,
+            username: result.username || `User_${chatId}`,
+            nickname: nickname
+          };
+        }
+      } catch (error) {
         userInfo = {
           id: chatId,
           username: `User_${chatId}`,
           nickname: `User_${chatId}`
-        };
-      } else {
-        const result = data.result;
-        const nickname = result.first_name
-          ? `${result.first_name}${result.last_name ? ` ${result.last_name}` : ''}`.trim()
-          : result.username || `User_${chatId}`;
-        userInfo = {
-          id: result.id || chatId,
-          username: result.username || `User_${chatId}`,
-          nickname: nickname
         };
       }
 
@@ -1113,7 +1284,7 @@ export default {
         body: JSON.stringify({ chat_id: GROUP_ID, name: `${nickname}` })
       });
       const data = await response.json();
-      if (!data.ok) throw new Error(`Failed to create forum topic: ${data.description}`);
+      if (!data.ok) throw new Error(`Failed to create forum topic`);
       const topicId = data.result.message_thread_id;
 
       const now = new Date();
@@ -1159,7 +1330,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to send message to topic ${topicId}: ${data.description}`);
+        throw new Error(`Failed to send message to topic`);
       }
       return data;
     }
@@ -1179,7 +1350,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to copy message to topic ${topicId}: ${data.description}`);
+        throw new Error(`Failed to copy message to topic`);
       }
     }
 
@@ -1196,7 +1367,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to pin message: ${data.description}`);
+        throw new Error(`Failed to pin message`);
       }
     }
 
@@ -1214,7 +1385,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to forward message to private chat: ${data.description}`);
+        throw new Error(`Failed to forward message to private chat`);
       }
     }
 
@@ -1227,7 +1398,7 @@ export default {
       });
       const data = await response.json();
       if (!data.ok) {
-        throw new Error(`Failed to send message to user: ${data.description}`);
+        throw new Error(`Failed to send message to user`);
       }
     }
 
@@ -1235,7 +1406,7 @@ export default {
       for (let i = 0; i < retries; i++) {
         try {
           const controller = new AbortController();
-          const timeoutId = setTimeout(() => controller.abort(), 5000);
+          const timeoutId = setTimeout(() => controller.abort(), 10000); // 10秒超时
           const response = await fetch(url, { ...options, signal: controller.signal });
           clearTimeout(timeoutId);
 
@@ -1248,7 +1419,7 @@ export default {
             await new Promise(resolve => setTimeout(resolve, delay));
             continue;
           }
-          throw new Error(`Request failed with status ${response.status}: ${await response.text()}`);
+          throw new Error(`Request failed with status ${response.status}`);
         } catch (error) {
           if (i === retries - 1) throw error;
           await new Promise(resolve => setTimeout(resolve, backoff * Math.pow(2, i)));
@@ -1264,7 +1435,7 @@ export default {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: webhookUrl })
       }).then(r => r.json());
-      return new Response(response.ok ? 'Webhook set successfully' : JSON.stringify(response, null, 2));
+      return new Response(response.ok ? 'Webhook set successfully' : 'Webhook setting failed');
     }
 
     async function unRegisterWebhook() {
@@ -1273,7 +1444,7 @@ export default {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: '' })
       }).then(r => r.json());
-      return new Response(response.ok ? 'Webhook removed' : JSON.stringify(response, null, 2));
+      return new Response(response.ok ? 'Webhook removed' : 'Webhook removal failed');
     }
 
     try {
